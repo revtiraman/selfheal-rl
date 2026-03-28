@@ -23,7 +23,7 @@ _scorer = LLMScorer(mode="heuristic")
 def _load_ppo_model():
     try:
         from stable_baselines3 import PPO
-        for path in ["models/selfheal_agent_final.zip", "models/phase1_easy.zip"]:
+        for path in ["models/selfheal_agent_final.zip", "models/phase3_hard_partial_best.zip", "models/phase1_easy.zip"]:
             if os.path.exists(path):
                 return PPO.load(path)
     except Exception:

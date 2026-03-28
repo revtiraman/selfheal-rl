@@ -85,6 +85,8 @@ class SelfHealEnv(gym.Env):
         self.total_reward: float = 0.0
         self._prev_down: set = set()
         self._prev_degraded: set = set()
+        self._rewarded_recovery: set = set()  # prevent reward-farming same service
+        self._observed_this_episode: set = set()  # track first vs repeat observes
 
     def reset(
         self,
@@ -107,6 +109,8 @@ class SelfHealEnv(gym.Env):
         self.actions_remaining = ACTION_BUDGET
         self.episode_history = []
         self.total_reward = 0.0
+        self._rewarded_recovery = set()
+        self._observed_this_episode = set()
 
         # Generate and apply failure scenario
         if self.difficulty == "CHAOS":
@@ -248,13 +252,20 @@ class SelfHealEnv(gym.Env):
             return reward
 
         if is_observe:
-            # Small bonus for first observe of unobserved service
-            if target_service in self.obs_encoder.observed_services:
+            if target_service not in self._observed_this_episode:
+                # First time observing this service — small info bonus
+                self._observed_this_episode.add(target_service)
                 reward += 1.0
+            else:
+                # Repeated observe: penalize if there are down services to fix
+                down_count = len(self.mesh.get_down_services())
+                if down_count > 0:
+                    reward -= 2.0  # stop staring, start acting
             return reward
 
-        # Service recovery: services that were down/degraded and are now recovering
-        if success and svc.recovering:
+        # Service recovery: only reward the FIRST recovery per service per episode
+        if success and svc.recovering and target_service not in self._rewarded_recovery:
+            self._rewarded_recovery.add(target_service)
             reward += 10.0
 
             # Root cause bonus
