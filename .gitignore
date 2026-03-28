@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pycache
+.DS_Store
+*.zip
+models/
+logs/
+*.egg-info/
+dist/
+build/
+.env
+*.log
