@@ -249,18 +249,25 @@ class SelfHealEnv(gym.Env):
         reward -= 1.0
 
         if is_noop:
+            down_count = len(self.mesh.get_down_services())
+            if down_count > 0:
+                reward -= 3.0 * down_count  # urgency: can't do nothing while things are on fire
             return reward
 
         if is_observe:
+            down_services = set(self.mesh.get_down_services())
+            degraded_services = set(self.mesh.get_degraded_services())
             if target_service not in self._observed_this_episode:
-                # First time observing this service — small info bonus
                 self._observed_this_episode.add(target_service)
-                reward += 1.0
+                # Big bonus for observing an afflicted service, tiny bonus otherwise
+                if target_service in down_services or target_service in degraded_services:
+                    reward += 3.0
+                else:
+                    reward += 0.2
             else:
-                # Repeated observe: penalize if there are down services to fix
-                down_count = len(self.mesh.get_down_services())
-                if down_count > 0:
-                    reward -= 2.0  # stop staring, start acting
+                # Repeated observe is always penalized when something is down
+                if down_services:
+                    reward -= 3.0
             return reward
 
         # Service recovery: only reward the FIRST recovery per service per episode
