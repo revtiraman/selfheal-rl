@@ -345,6 +345,25 @@ class SelfHealEnv(gym.Env):
             "cascade_history": self.cascade_sim.cascade_history,
         }
 
+    def state(self) -> dict:
+        """Return current environment state (OpenEnv spec)."""
+        return {
+            "step": self.current_step,
+            "max_steps": MAX_STEPS_PER_EPISODE,
+            "actions_remaining": self.actions_remaining,
+            "done": (
+                self.mesh.is_fully_recovered()
+                or self.mesh.all_down()
+                or self.current_step >= MAX_STEPS_PER_EPISODE
+            ),
+            "total_reward": self.total_reward,
+            "system_health": self.mesh.system_health(),
+            "down_services": self.mesh.get_down_services(),
+            "degraded_services": self.mesh.get_degraded_services(),
+            "difficulty": self.difficulty,
+            "scenario": str(self.scenario) if self.scenario else None,
+        }
+
 
 if __name__ == "__main__":
     # Quick validation

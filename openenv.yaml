@@ -1,0 +1,88 @@
+---
+title: SelfHealRL — Autonomous Microservices Recovery
+emoji: 🏥
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+app_port: 8000
+base_path: /
+tags:
+  - openenv
+  - reinforcement-learning
+  - microservices
+  - autonomous-agents
+  - rl-environment
+
+environment:
+  name: selfheal-rl
+  version: "1.0.0"
+  description: >
+    An RL environment where an agent must diagnose and fix cascading failures
+    in a 10-service microservice mesh. The agent observes service health metrics
+    and takes recovery actions (restart, scale_up, rollback, reroute, observe)
+    to restore system health before the action budget runs out.
+
+  author: revtiraman
+  license: MIT
+
+  observation_space:
+    type: Box
+    shape: [74]
+    dtype: float32
+    low: -1.0
+    high: 1.0
+    description: >
+      74-dimensional float vector. 7 values per service (status, cpu, memory,
+      latency, error_rate, recovering, observed) × 10 services + 4 global
+      values (step/max_steps, actions_remaining/budget, system_health,
+      num_down_services). Unobserved services have -1.0 for metric fields
+      when partial_observability=True.
+
+  action_space:
+    type: Discrete
+    n: 60
+    description: >
+      60 discrete actions = 6 action types × 10 services.
+      Action types: restart(0), scale_up(1), reroute(2), rollback(3),
+      observe(4), do_nothing(5). Encoded as action_type_idx * 10 + service_idx.
+
+  tasks:
+    - task_id: task_easy
+      name: Single Fault Recovery
+      difficulty: EASY
+      description: >
+        A single service (api-gateway) has a CPU spike. Agent must diagnose
+        and fix it before cascade. Full observability. Pass score >= 0.7.
+      passing_score: 0.7
+
+    - task_id: task_medium
+      name: Cascade Recovery
+      difficulty: MEDIUM
+      description: >
+        user-db disk_full triggers a 4-service cascade. Partial observability.
+        Agent must fix in correct dependency order. Pass score >= 0.6.
+      passing_score: 0.6
+
+    - task_id: task_hard
+      name: Multi-Fault Recovery
+      difficulty: HARD
+      description: >
+        Two simultaneous root failures (user-db + cache-layer) cause 8+
+        service cascade. Partial observability, tight budget. Pass score >= 0.5.
+      passing_score: 0.5
+
+  reward:
+    type: dense
+    range: [-200, 100]
+    description: >
+      Multi-component reward per step. Key signals:
+      +10 service recovered (once per service per episode),
+      +15 root cause fixed,
+      +1 first observe of a service,
+      -1 time penalty per step,
+      -2 repeat observe while services down,
+      -3×N do_nothing while N services down,
+      -5 wrong dependency order,
+      +20 full system recovery bonus,
+      -10 timeout penalty.

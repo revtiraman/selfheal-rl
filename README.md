@@ -1,3 +1,19 @@
+---
+title: SelfHealRL
+emoji: 🏥
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 8000
+pinned: false
+tags:
+  - openenv
+  - reinforcement-learning
+  - microservices
+  - autonomous-agents
+  - rl-environment
+---
+
 # SelfHealRL — Autonomous Microservices Recovery Agent
 
 An RL agent that learns to **diagnose and fix cascading failures** in a 10-service microservice mesh. Built with Gymnasium, Stable-Baselines3, and Gradio.

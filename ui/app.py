@@ -202,11 +202,7 @@ def run_llm_analysis(difficulty, agent_type):
 AGENT_CHOICES = ["Heuristic Agent", "Random Agent", "Trained PPO Agent"]
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(
-        title="SelfHealRL — Autonomous Microservices Recovery",
-        theme=gr.themes.Base(primary_hue="blue", neutral_hue="slate"),
-        css=".gradio-container { max-width: 1200px !important; }",
-    ) as demo:
+    with gr.Blocks(title="SelfHealRL — Autonomous Microservices Recovery") as demo:
         gr.Markdown(
             "# 🏥 SelfHealRL — Autonomous Microservices Recovery\n"
             "> RL agent that diagnoses and fixes cascading failures in microservices"
@@ -263,4 +259,4 @@ def build_app() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    build_app().launch(share=False)
+    build_app().launch(share=False, theme=gr.themes.Base(primary_hue="blue", neutral_hue="slate"))
