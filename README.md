@@ -37,6 +37,8 @@ tags:
 
 **[🎮 Try the Live Demo](https://huggingface.co/spaces/revti126/selfheal-rl-demo)** · **[📖 API Docs](https://revti126-selfheal-rl.hf.space/docs)**
 
+![SelfHealRL Demo](docs/demo.gif)
+
 ---
 
 ## 🚨 The Problem
