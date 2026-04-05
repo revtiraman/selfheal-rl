@@ -27,6 +27,7 @@ dependencies = [
 ]
 
 [project.scripts]
+server = "server.app:main"
 selfheal-rl-server = "server.app:main"
 
 [tool.setuptools.packages.find]
