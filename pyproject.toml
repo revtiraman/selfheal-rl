@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "selfheal-rl"
+version = "1.0.0"
+description = "OpenEnv RL environment for autonomous microservice recovery"
+authors = [{ name = "revtiraman", email = "revtiraman1234@gmail.com" }]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium>=0.29.0",
+    "stable-baselines3>=2.1.0",
+    "sb3-contrib>=2.1.0",
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "pydantic>=2.0.0",
+    "openai>=1.0.0",
+    "httpx>=0.24.0",
+    "gradio>=6.0.0",
+    "pyyaml>=6.0",
+    "requests>=2.31.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "env*", "server*", "training*", "ui*"]
