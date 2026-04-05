@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "selfheal-rl"
@@ -10,6 +10,7 @@ authors = [{ name = "revtiraman", email = "revtiraman1234@gmail.com" }]
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
+    "openenv-core>=0.2.0",
     "gymnasium>=0.29.0",
     "stable-baselines3>=2.1.0",
     "sb3-contrib>=2.1.0",
@@ -24,6 +25,9 @@ dependencies = [
     "pyyaml>=6.0",
     "requests>=2.31.0",
 ]
+
+[project.scripts]
+selfheal-rl-server = "server.app:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
