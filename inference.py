@@ -41,10 +41,10 @@ from env.selfheal_env import SelfHealEnv
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN     = os.environ.get("HF_TOKEN", os.environ.get("OPENAI_API_KEY", ""))
+HF_TOKEN     = os.environ.get("HF_TOKEN")
 
 if not HF_TOKEN:
-    print("ERROR: HF_TOKEN (or OPENAI_API_KEY) environment variable not set.")
+    print("ERROR: HF_TOKEN environment variable not set.")
     sys.exit(1)
 
 client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
@@ -201,8 +201,8 @@ def llm_action(observation_text: str, history: list) -> tuple[str, str, str]:
 # Run one task
 # ─────────────────────────────────────────────────────────────────
 
-def run_task(task_id: str, seed: int = 42, verbose: bool = True) -> dict:
-    """Run a single task with the LLM agent. Returns grade dict."""
+def run_task(task_id: str, seed: int = 42) -> dict:
+    """Run a single task with the LLM agent. Emits [START]/[STEP]/[END] logs."""
     task = TASKS[task_id]
     engine = FailureEngine()
 
@@ -223,9 +223,17 @@ def run_task(task_id: str, seed: int = 42, verbose: bool = True) -> dict:
     env._prev_down = set(env.mesh.get_down_services())
     env._prev_degraded = set(env.mesh.get_degraded_services())
 
-    if verbose:
-        print(f"\n  Scenario: {scenario.description}")
-        print(f"  Root causes: {[s for s, _ in scenario.root_failures]}")
+    # [START] log
+    print(json.dumps({
+        "type": "START",
+        "task_id": task_id,
+        "task_name": task.name,
+        "difficulty": task.difficulty,
+        "scenario": scenario.description,
+        "model": MODEL_NAME,
+        "seed": seed,
+    }))
+    sys.stdout.flush()
 
     action_history = []
     done = False
@@ -237,9 +245,7 @@ def run_task(task_id: str, seed: int = 42, verbose: bool = True) -> dict:
         try:
             action_type, target_service, reasoning = llm_action(obs_text, action_history)
         except Exception as e:
-            if verbose:
-                print(f"  ⚠️  LLM error at step {step}: {e} — using observe fallback")
-            action_type, target_service, reasoning = "observe", SERVICE_NAMES[0], "fallback"
+            action_type, target_service, reasoning = "observe", SERVICE_NAMES[0], f"fallback:{e}"
 
         action_int = (
             ACTION_TYPES.index(action_type) * len(SERVICE_NAMES)
@@ -257,16 +263,41 @@ def run_task(task_id: str, seed: int = 42, verbose: bool = True) -> dict:
             "reward": reward,
         })
 
-        if verbose:
-            health = env.mesh.system_health()
-            down = env.mesh.get_down_services()
-            print(
-                f"  Step {step:2d}: {action_type:8s}({target_service:22s}) "
-                f"r={reward:+6.1f}  health={health:.0%}  down={down}"
-            )
+        # [STEP] log
+        print(json.dumps({
+            "type": "STEP",
+            "task_id": task_id,
+            "step": step,
+            "action": f"{action_type}({target_service})",
+            "action_type": action_type,
+            "target_service": target_service,
+            "reward": round(reward, 4),
+            "system_health": round(env.mesh.system_health(), 4),
+            "down_services": env.mesh.get_down_services(),
+            "done": done,
+            "reasoning": reasoning,
+        }))
+        sys.stdout.flush()
 
     summary = env.get_episode_summary()
     grade = TaskGrader.grade(task_id, summary)
+
+    # [END] log
+    print(json.dumps({
+        "type": "END",
+        "task_id": task_id,
+        "task_name": task.name,
+        "score": grade["score"],
+        "passed": grade["passed"],
+        "passing_score": grade["passing_score"],
+        "fully_recovered": summary.get("fully_recovered", False),
+        "final_health": round(summary.get("final_health", 0.0), 4),
+        "steps_taken": step,
+        "total_reward": round(summary.get("total_reward", 0.0), 4),
+        "breakdown": grade["breakdown"],
+    }))
+    sys.stdout.flush()
+
     return grade
 
 
@@ -275,69 +306,49 @@ def run_task(task_id: str, seed: int = 42, verbose: bool = True) -> dict:
 # ─────────────────────────────────────────────────────────────────
 
 def main():
-    print("=" * 65)
-    print("  SelfHealRL — Baseline Inference")
-    print(f"  Model:   {MODEL_NAME}")
-    print(f"  API:     {API_BASE_URL}")
-    print("=" * 65)
-
     results = {}
     total_start = time.time()
 
     for task_id in ["task_easy", "task_medium", "task_hard"]:
         task = TASKS[task_id]
-        print(f"\n{'─' * 65}")
-        print(f"Task: {task_id} — {task.name} [{task.difficulty}]")
-        print(f"{'─' * 65}")
-
         start = time.time()
         try:
-            grade = run_task(task_id, seed=42, verbose=True)
-            elapsed = time.time() - start
+            grade = run_task(task_id, seed=42)
             results[task_id] = grade
-            status = "✅ PASSED" if grade["passed"] else "❌ FAILED"
-            print(f"\n  {status} | score={grade['score']:.4f} | "
-                  f"pass>={grade['passing_score']} | {elapsed:.1f}s")
-            print(f"  Breakdown: {grade['breakdown']}")
         except Exception as e:
             elapsed = time.time() - start
-            print(f"\n  ❌ ERROR: {e} ({elapsed:.1f}s)")
+            print(json.dumps({
+                "type": "END",
+                "task_id": task_id,
+                "score": 0.0,
+                "passed": False,
+                "passing_score": task.passing_score,
+                "error": str(e),
+            }))
+            sys.stdout.flush()
             results[task_id] = {
                 "task_id": task_id, "score": 0.0, "passed": False,
                 "passing_score": task.passing_score,
                 "breakdown": {}, "details": {"error": str(e)},
             }
 
-    # Summary
     total_elapsed = time.time() - total_start
     overall = sum(r["score"] for r in results.values()) / len(results)
     all_passed = all(r["passed"] for r in results.values())
 
-    print(f"\n{'=' * 65}")
-    print(f"  BASELINE RESULTS  (total time: {total_elapsed:.1f}s)")
-    print(f"{'=' * 65}")
-    print(f"  {'Task':<15} {'Score':>8}  {'Pass':>6}  {'Status'}")
-    print(f"  {'-'*50}")
-    for task_id, grade in results.items():
-        status = "✅" if grade["passed"] else "❌"
-        print(
-            f"  {task_id:<15} {grade['score']:>8.4f}  "
-            f"{grade['passing_score']:>6.1f}  {status}"
-        )
-    print(f"  {'-'*50}")
-    print(f"  {'OVERALL':<15} {overall:>8.4f}  {'':>6}  "
-          f"{'✅ ALL PASSED' if all_passed else '⚠️  SOME FAILED'}")
-    print(f"{'=' * 65}")
-
-    # Machine-readable output
-    output = {
+    # Final summary
+    print(json.dumps({
+        "type": "SUMMARY",
         "model": MODEL_NAME,
-        "tasks": results,
         "overall_score": round(overall, 4),
         "all_passed": all_passed,
         "total_time_seconds": round(total_elapsed, 1),
-    }
-    print("\nJSON_OUTPUT:", json.dumps(output))
+        "tasks": {
+            tid: {"score": r["score"], "passed": r["passed"]}
+            for tid, r in results.items()
+        },
+    }))
+    sys.stdout.flush()
 
     return 0 if all_passed else 1
 
