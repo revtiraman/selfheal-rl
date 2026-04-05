@@ -28,16 +28,16 @@ environment:
 
   observation_space:
     type: Box
-    shape: [74]
+    shape: [104]
     dtype: float32
     low: -1.0
     high: 1.0
     description: >
-      74-dimensional float vector. 7 values per service (status, cpu, memory,
-      latency, error_rate, recovering, observed) × 10 services + 4 global
-      values (step/max_steps, actions_remaining/budget, system_health,
-      num_down_services). Unobserved services have -1.0 for metric fields
-      when partial_observability=True.
+      104-dimensional float vector. 10 features per service × 10 services + 4 global.
+      Per-service: observed_flag, cpu, memory, latency_norm, error_rate, status,
+      alert_active, has_unmet_deps, steps_since_observed_norm, estimated_failure_type.
+      Global: step_norm, actions_remaining_norm, system_health, alert_count_norm.
+      Unobserved services have -1.0 for metric fields when partial_observability=True.
 
   action_space:
     type: Discrete

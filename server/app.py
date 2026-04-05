@@ -60,17 +60,27 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────────────────────────
-# Session store (single-session for HF Spaces)
+# Session store — supports parallel evaluators via session_id
 # ─────────────────────────────────────────────────────────────────
 
-_session: Dict[str, Any] = {
-    "env": None,
-    "episode_id": None,
-    "task_id": None,
-    "done": False,
-}
+def _new_session() -> Dict[str, Any]:
+    return {"env": None, "episode_id": None, "task_id": None, "done": False}
 
+_sessions: Dict[str, Dict[str, Any]] = {"default": _new_session()}
 _failure_engine = FailureEngine()
+
+
+def _get_session(session_id: str) -> Dict[str, Any]:
+    if session_id not in _sessions:
+        _sessions[session_id] = _new_session()
+    return _sessions[session_id]
+
+
+def _get_active_env(session_id: str) -> SelfHealEnv:
+    sess = _get_session(session_id)
+    if sess["env"] is None:
+        raise HTTPException(status_code=400, detail="No active episode. Call POST /reset first.")
+    return sess["env"]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -87,6 +97,7 @@ def _build_observation(env: SelfHealEnv, task_id: Optional[str] = None) -> SelfH
     for name in SERVICE_NAMES:
         d = statuses[name]
         svc = env.mesh.services[name]
+        is_observed = name in env.obs_encoder.observed_services or not env.partial_observability
         services.append(ServiceStatus(
             name=name,
             status=d["status"],
@@ -94,9 +105,10 @@ def _build_observation(env: SelfHealEnv, task_id: Optional[str] = None) -> SelfH
             memory=d.get("memory", -1.0),
             latency_ms=d.get("latency", -1.0),
             error_rate=d.get("error_rate", -1.0),
-            observed=name in env.obs_encoder.observed_services or not env.partial_observability,
+            observed=is_observed,
             alert=name in alerts,
             recovering=svc.recovering,
+            failure_type=svc.failure_type if is_observed else None,
         ))
 
     return SelfHealObservation(
@@ -123,10 +135,6 @@ def _build_reward(reward_value: float, env: SelfHealEnv) -> SelfHealReward:
     )
 
 
-def _get_env() -> SelfHealEnv:
-    if _session["env"] is None:
-        raise HTTPException(status_code=400, detail="No active episode. Call POST /reset first.")
-    return _session["env"]
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -166,6 +174,7 @@ def reset(
     difficulty: str = Query(default="EASY", description="EASY | MEDIUM | HARD | CHAOS"),
     partial_observability: bool = Query(default=False),
     seed: Optional[int] = Query(default=None),
+    session_id: str = Query(default="default", description="Session ID for parallel evaluators"),
 ):
     """Start a new episode with a random scenario."""
     if difficulty not in ("EASY", "MEDIUM", "HARD", "CHAOS"):
@@ -174,16 +183,19 @@ def reset(
     env = SelfHealEnv(difficulty=difficulty, partial_observability=partial_observability)
     env.reset(seed=seed)
 
-    _session["env"] = env
-    _session["episode_id"] = str(uuid.uuid4())
-    _session["task_id"] = None
-    _session["done"] = False
+    sess = _get_session(session_id)
+    episode_id = str(uuid.uuid4())
+    sess["env"] = env
+    sess["episode_id"] = episode_id
+    sess["task_id"] = None
+    sess["done"] = False
 
     obs = _build_observation(env)
     return ResetResponse(
         observation=obs,
         info={
-            "episode_id": _session["episode_id"],
+            "session_id": session_id,
+            "episode_id": episode_id,
             "difficulty": difficulty,
             "scenario": str(env.scenario),
             "partial_observability": partial_observability,
@@ -192,7 +204,11 @@ def reset(
 
 
 @app.post("/reset/{task_id}", response_model=ResetResponse)
-def reset_task(task_id: str, seed: Optional[int] = Query(default=None)):
+def reset_task(
+    task_id: str,
+    seed: Optional[int] = Query(default=None),
+    session_id: str = Query(default="default", description="Session ID for parallel evaluators"),
+):
     """Start a new episode for a specific named task."""
     if task_id not in TASKS:
         raise HTTPException(
@@ -218,16 +234,19 @@ def reset_task(task_id: str, seed: Optional[int] = Query(default=None)):
     env._prev_down = set(env.mesh.get_down_services())
     env._prev_degraded = set(env.mesh.get_degraded_services())
 
-    _session["env"] = env
-    _session["episode_id"] = str(uuid.uuid4())
-    _session["task_id"] = task_id
-    _session["done"] = False
+    sess = _get_session(session_id)
+    episode_id = str(uuid.uuid4())
+    sess["env"] = env
+    sess["episode_id"] = episode_id
+    sess["task_id"] = task_id
+    sess["done"] = False
 
     obs = _build_observation(env, task_id=task_id)
     return ResetResponse(
         observation=obs,
         info={
-            "episode_id": _session["episode_id"],
+            "session_id": session_id,
+            "episode_id": episode_id,
             "task_id": task_id,
             "task_name": task.name,
             "difficulty": task.difficulty,
@@ -239,11 +258,15 @@ def reset_task(task_id: str, seed: Optional[int] = Query(default=None)):
 
 
 @app.post("/step", response_model=StepResponse)
-def step(action: SelfHealAction):
+def step(
+    action: SelfHealAction,
+    session_id: str = Query(default="default", description="Session ID for parallel evaluators"),
+):
     """Take one action in the current episode."""
-    env = _get_env()
+    env = _get_active_env(session_id)
+    sess = _get_session(session_id)
 
-    if _session["done"]:
+    if sess["done"]:
         raise HTTPException(
             status_code=400,
             detail="Episode is done. Call POST /reset to start a new one."
@@ -253,23 +276,22 @@ def step(action: SelfHealAction):
     obs_vec, reward, terminated, truncated, info = env.step(action_int)
 
     done = terminated or truncated
-    _session["done"] = done
+    sess["done"] = done
 
-    obs = _build_observation(env, task_id=_session["task_id"])
+    obs = _build_observation(env, task_id=sess["task_id"])
     reward_obj = _build_reward(reward, env)
 
-    # Decode what action was taken
     at = ACTION_TYPES[action_int // len(SERVICE_NAMES)]
     tgt = SERVICE_NAMES[action_int % len(SERVICE_NAMES)]
 
     step_info: Dict[str, Any] = {
-        "episode_id": _session["episode_id"],
+        "session_id": session_id,
+        "episode_id": sess["episode_id"],
         "action_taken": f"{at}({tgt})",
         "action_success": env.episode_history[-1].action_success if env.episode_history else None,
         "step": env.current_step,
     }
 
-    # Add grader results when episode ends
     if done:
         summary = env.get_episode_summary()
         grades = Grader.grade_all(summary)
@@ -281,9 +303,8 @@ def step(action: SelfHealAction):
         step_info["overall_score"] = grades["overall_score"]
         step_info["fully_recovered"] = env.mesh.is_fully_recovered()
 
-        # Task-specific grade if running a task
-        if _session["task_id"]:
-            task_grade = TaskGrader.grade(_session["task_id"], summary)
+        if sess["task_id"]:
+            task_grade = TaskGrader.grade(sess["task_id"], summary)
             step_info["task_grade"] = task_grade
 
     return StepResponse(
@@ -296,23 +317,145 @@ def step(action: SelfHealAction):
 
 
 @app.get("/state", response_model=StateResponse)
-def state():
+def state(
+    session_id: str = Query(default="default", description="Session ID for parallel evaluators"),
+):
     """Return current episode state."""
-    env = _get_env()
+    env = _get_active_env(session_id)
+    sess = _get_session(session_id)
     s = env.state()
     return StateResponse(
-        episode_id=_session["episode_id"] or "unknown",
-        task_id=_session["task_id"],
+        episode_id=sess["episode_id"] or "unknown",
+        task_id=sess["task_id"],
         difficulty=s["difficulty"],
         step=s["step"],
         max_steps=s["max_steps"],
         actions_remaining=s["actions_remaining"],
-        done=_session["done"],
+        done=sess["done"],
         total_reward=s["total_reward"],
         system_health=s["system_health"],
         down_services=s["down_services"],
         scenario=s["scenario"],
     )
+
+
+# ─────────────────────────────────────────────────────────────────
+# Evaluate endpoint — run heuristic agent, return grade directly
+# ─────────────────────────────────────────────────────────────────
+
+def _run_heuristic_episode(task_id: str, seed: int) -> dict:
+    """Run one episode with the heuristic agent and return the task grade."""
+    from core.heuristic_agent import HeuristicAgent
+
+    task = TASKS[task_id]
+    engine = FailureEngine()
+    env = SelfHealEnv(
+        difficulty=task.difficulty,
+        partial_observability=task.partial_observability,
+    )
+    env.reset(seed=seed)
+
+    scenario = engine.generate_from_template(task.scenario_template)
+    env.mesh.reset()
+    engine.apply_scenario(env.mesh, scenario)
+    env.cascade_sim.reset()
+    for svc, _ in scenario.root_failures:
+        env.cascade_sim.record_root_cause(svc)
+    env.scenario = scenario
+    env._prev_down = set(env.mesh.get_down_services())
+    env._prev_degraded = set(env.mesh.get_degraded_services())
+
+    agent = HeuristicAgent()
+    agent.reset()
+
+    for _ in range(task.max_steps):
+        statuses = env.mesh.get_all_statuses()
+        act_type, target = agent.act(statuses)
+        if act_type == "observe":
+            svc_data = env.mesh.services.get(target)
+            if svc_data:
+                agent.record_observation(target, svc_data.failure_type or "unknown")
+        action_int = agent.action_to_int(act_type, target)
+        _, _, term, trunc, _ = env.step(action_int)
+        if term or trunc:
+            break
+
+    summary = env.get_episode_summary()
+    return TaskGrader.grade(task_id, summary)
+
+
+@app.post("/evaluate/{task_id}")
+def evaluate_task(
+    task_id: str,
+    num_episodes: int = Query(default=5, ge=1, le=20, description="Episodes to average over"),
+    seed: Optional[int] = Query(default=None),
+):
+    """Run the built-in heuristic agent against a task and return the grade.
+
+    Useful for verifying the environment works correctly without an external agent.
+    Returns averaged scores across num_episodes.
+    """
+    if task_id not in TASKS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown task_id '{task_id}'. Available: {list(TASKS.keys())}"
+        )
+
+    base_seed = seed if seed is not None else 42
+    grades = [_run_heuristic_episode(task_id, seed=base_seed + i) for i in range(num_episodes)]
+
+    task = TASKS[task_id]
+    avg_score = sum(g["score"] for g in grades) / len(grades)
+    pass_rate = sum(1 for g in grades if g["passed"]) / len(grades)
+
+    # Average breakdown per grader
+    all_keys = grades[0]["breakdown"].keys()
+    avg_breakdown = {
+        k: round(sum(g["breakdown"].get(k, 0.0) for g in grades) / len(grades), 4)
+        for k in all_keys
+    }
+
+    return {
+        "task_id": task_id,
+        "task_name": task.name,
+        "difficulty": task.difficulty,
+        "num_episodes": num_episodes,
+        "avg_score": round(avg_score, 4),
+        "pass_rate": round(pass_rate, 4),
+        "passed": avg_score >= task.passing_score,
+        "passing_score": task.passing_score,
+        "avg_breakdown": avg_breakdown,
+        "agent": "heuristic",
+    }
+
+
+@app.post("/evaluate")
+def evaluate_all(
+    num_episodes: int = Query(default=5, ge=1, le=20),
+    seed: Optional[int] = Query(default=None),
+):
+    """Run the heuristic agent against all tasks and return overall score."""
+    base_seed = seed if seed is not None else 42
+    results = {}
+    for tid in TASKS:
+        grades = [_run_heuristic_episode(tid, seed=base_seed + i) for i in range(num_episodes)]
+        task = TASKS[tid]
+        avg_score = sum(g["score"] for g in grades) / len(grades)
+        results[tid] = {
+            "avg_score": round(avg_score, 4),
+            "pass_rate": round(sum(1 for g in grades if g["passed"]) / len(grades), 4),
+            "passed": avg_score >= task.passing_score,
+            "passing_score": task.passing_score,
+        }
+
+    overall = sum(r["avg_score"] for r in results.values()) / len(results)
+    return {
+        "tasks": results,
+        "overall_score": round(overall, 4),
+        "all_passed": all(r["passed"] for r in results.values()),
+        "num_episodes_per_task": num_episodes,
+        "agent": "heuristic",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────

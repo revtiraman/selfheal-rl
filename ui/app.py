@@ -23,7 +23,14 @@ _scorer = LLMScorer(mode="heuristic")
 def _load_ppo_model():
     try:
         from sb3_contrib import RecurrentPPO
-        for path in ["models/selfheal_agent_final.zip", "models/phase4_chaos.zip", "models/phase3_hard_partial.zip"]:
+        candidates = [
+            "models/phase4_chaos_best.zip",
+            "models/phase4_chaos.zip",
+            "models/phase3_hard_partial_best.zip",
+            "models/phase3_hard_partial.zip",
+            "models/selfheal_agent_final.zip",
+        ]
+        for path in candidates:
             if os.path.exists(path):
                 return RecurrentPPO.load(path)
     except Exception:

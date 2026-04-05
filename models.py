@@ -124,6 +124,10 @@ class ServiceStatus(BaseModel):
     recovering: bool = Field(
         ..., description="Whether a recovery action is in progress."
     )
+    failure_type: Optional[str] = Field(
+        default=None,
+        description="Failure type if observed (memory_leak, cpu_spike, disk_full, etc.). None if not yet observed."
+    )
 
 
 class SelfHealObservation(BaseModel):
