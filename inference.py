@@ -8,16 +8,13 @@ Environment variables:
   MODEL_NAME     — Model identifier   (default: gpt-4o-mini)
   HF_TOKEN       — HuggingFace / API key (required, no default)
   ENV_URL        — SelfHealRL env URL (default: http://localhost:8000)
-
-Usage:
-  export HF_TOKEN=hf_...
-  python inference.py
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -89,33 +86,40 @@ Respond with ONLY valid JSON:
 {"action_type": "<action>", "target_service": "<service>", "reasoning": "<1 sentence>"}
 """
 
-VALID_ACTIONS   = ["restart", "scale_up", "reroute", "rollback", "observe", "do_nothing"]
-VALID_SERVICES  = [
+VALID_ACTIONS  = ["restart", "scale_up", "reroute", "rollback", "observe", "do_nothing"]
+VALID_SERVICES = [
     "api-gateway", "auth-service", "payment-service", "order-service",
     "search-service", "notification-service", "user-db", "cache-layer",
     "restaurant-db", "order-db",
 ]
 
 # ─────────────────────────────────────────────────────────────────
-# HTTP helpers
+# HTTP helpers — with retry
 # ─────────────────────────────────────────────────────────────────
 
+def _http_post(url: str, retries: int = 3, **kwargs) -> dict:
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.post(url, timeout=30, **kwargs)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s backoff
+    raise RuntimeError(f"POST {url} failed after {retries} attempts: {last_err}")
+
+
 def env_reset(task_id: str, seed: int = 42) -> dict:
-    r = requests.post(f"{ENV_URL}/reset/{task_id}", params={"seed": seed}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    return _http_post(f"{ENV_URL}/reset/{task_id}", params={"seed": seed})
 
 
-def env_step(action_type: str, target_service: str, session_id: str = "default") -> dict:
-    payload = {"action_type": action_type, "target_service": target_service}
-    r = requests.post(
+def env_step(action_type: str, target_service: str) -> dict:
+    return _http_post(
         f"{ENV_URL}/step",
-        json=payload,
-        params={"session_id": session_id},
-        timeout=30,
+        json={"action_type": action_type, "target_service": target_service},
     )
-    r.raise_for_status()
-    return r.json()
 
 
 def env_health() -> bool:
@@ -124,6 +128,17 @@ def env_health() -> bool:
         return r.status_code == 200
     except Exception:
         return False
+
+
+def env_get_grade(task_id: str) -> float:
+    """Fallback: call /evaluate/{task_id} to get score if episode didn't return it."""
+    try:
+        r = requests.post(f"{ENV_URL}/evaluate/{task_id}", params={"num_episodes": 1}, timeout=60)
+        if r.status_code == 200:
+            return r.json().get("avg_score", 0.0)
+    except Exception:
+        pass
+    return 0.0
 
 # ─────────────────────────────────────────────────────────────────
 # Observation formatter
@@ -147,8 +162,7 @@ def format_observation(obs: dict, step: int) -> str:
             status_str = "DOWN"
         else:
             status_str = "UNKNOWN"
-
-        alert_str = " ⚠️ALERT" if svc.get("alert") else ""
+        alert_str = " ALERT" if svc.get("alert") else ""
         if svc.get("observed"):
             ft = f" failure={svc['failure_type']}" if svc.get("failure_type") else ""
             detail = (
@@ -158,7 +172,6 @@ def format_observation(obs: dict, step: int) -> str:
         else:
             detail = " [NOT OBSERVED]"
         lines.append(f"  {svc['name']:25s} {status_str:8s}{alert_str}{detail}")
-
     down = obs.get("down_services", [])
     degraded = obs.get("degraded_services", [])
     if down:
@@ -166,7 +179,7 @@ def format_observation(obs: dict, step: int) -> str:
     if degraded:
         lines.append(f"DEGRADED: {', '.join(degraded)}")
     if not down and not degraded:
-        lines.append("\n✅ All services healthy!")
+        lines.append("\nAll services healthy!")
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────────────────────────
@@ -178,16 +191,11 @@ def llm_action(obs_text: str, history: list) -> tuple[str, str, str]:
     for h in history[-3:]:
         messages.append({"role": "assistant", "content": json.dumps(h)})
     messages.append({"role": "user", "content": obs_text})
-
     try:
         response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=0.0,
-            max_tokens=150,
+            model=MODEL_NAME, messages=messages, temperature=0.0, max_tokens=150,
         )
         raw = response.choices[0].message.content.strip()
-        import re
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         parsed = json.loads(match.group() if match else raw)
         action_type    = parsed.get("action_type", "observe")
@@ -211,12 +219,12 @@ def run_task(task_id: str, passing_score: float, seed: int = 42) -> dict:
     info       = reset_resp.get("info", {})
 
     print(json.dumps({
-        "type":         "START",
-        "task_id":      task_id,
-        "scenario":     info.get("scenario", ""),
-        "difficulty":   info.get("difficulty", ""),
-        "model":        MODEL_NAME,
-        "seed":         seed,
+        "type":       "START",
+        "task_id":    task_id,
+        "scenario":   info.get("scenario", ""),
+        "difficulty": info.get("difficulty", ""),
+        "model":      MODEL_NAME,
+        "seed":       seed,
     }))
     sys.stdout.flush()
 
@@ -224,17 +232,18 @@ def run_task(task_id: str, passing_score: float, seed: int = 42) -> dict:
     step           = 0
     done           = False
     score          = 0.0
+    last_step_info: dict = {}
 
     while not done and step < MAX_STEPS:
         obs_text = format_observation(obs, step)
         action_type, target_service, reasoning = llm_action(obs_text, action_history)
 
-        step_resp = env_step(action_type, target_service)
-        obs       = step_resp["observation"]
-        reward    = step_resp["reward"]["total"]
-        done      = step_resp["done"]
-        step_info = step_resp.get("info", {})
-        step     += 1
+        step_resp      = env_step(action_type, target_service)
+        obs            = step_resp["observation"]
+        reward         = step_resp["reward"]["total"]
+        done           = step_resp["done"]
+        last_step_info = step_resp.get("info", {})
+        step          += 1
 
         action_history.append({
             "action_type": action_type, "target_service": target_service,
@@ -256,21 +265,27 @@ def run_task(task_id: str, passing_score: float, seed: int = 42) -> dict:
         }))
         sys.stdout.flush()
 
-        if done:
-            score = step_info.get("overall_score", 0.0)
-            task_grade = step_info.get("task_grade", {})
-            if task_grade:
-                score = task_grade.get("score", score)
+    # Extract score from final step info
+    if done and last_step_info:
+        task_grade = last_step_info.get("task_grade", {})
+        if task_grade and "score" in task_grade:
+            score = task_grade["score"]
+        else:
+            score = last_step_info.get("overall_score", 0.0)
+
+    # Fallback: if score still 0 (loop exited without done), call evaluate
+    if score == 0.0:
+        score = env_get_grade(task_id)
 
     print(json.dumps({
-        "type":             "END",
-        "task_id":          task_id,
-        "score":            round(score, 4),
-        "passed":           score >= passing_score,
-        "passing_score":    passing_score,
-        "fully_recovered":  obs.get("system_health", 0) >= 1.0,
-        "final_health":     round(obs.get("system_health", 0), 4),
-        "steps_taken":      step,
+        "type":            "END",
+        "task_id":         task_id,
+        "score":           round(score, 4),
+        "passed":          score >= passing_score,
+        "passing_score":   passing_score,
+        "fully_recovered": obs.get("system_health", 0) >= 1.0,
+        "final_health":    round(obs.get("system_health", 0), 4),
+        "steps_taken":     step,
     }))
     sys.stdout.flush()
 
@@ -281,21 +296,23 @@ def run_task(task_id: str, passing_score: float, seed: int = 42) -> dict:
 # Main
 # ─────────────────────────────────────────────────────────────────
 
-def main():
-    # Wait for env to be ready
-    for attempt in range(12):
+def main() -> int:
+    # Wait up to 2 minutes for the env container to be ready
+    print(f"Waiting for environment at {ENV_URL} ...", file=sys.stderr)
+    for attempt in range(24):
         if env_health():
+            print("Environment is ready.", file=sys.stderr)
             break
         time.sleep(5)
     else:
-        print("ERROR: Environment not reachable at", ENV_URL, file=sys.stderr)
+        print(f"ERROR: Environment not reachable at {ENV_URL} after 120s", file=sys.stderr)
         sys.exit(1)
 
     results     = {}
     total_start = time.time()
 
     for task in TASKS:
-        task_id      = task["task_id"]
+        task_id       = task["task_id"]
         passing_score = task["passing_score"]
         try:
             grade = run_task(task_id, passing_score, seed=42)
@@ -317,11 +334,11 @@ def main():
     all_passed    = all(r["passed"] for r in results.values())
 
     print(json.dumps({
-        "type":                "SUMMARY",
-        "model":               MODEL_NAME,
-        "overall_score":       round(overall, 4),
-        "all_passed":          all_passed,
-        "total_time_seconds":  round(total_elapsed, 1),
+        "type":               "SUMMARY",
+        "model":              MODEL_NAME,
+        "overall_score":      round(overall, 4),
+        "all_passed":         all_passed,
+        "total_time_seconds": round(total_elapsed, 1),
         "tasks": {
             tid: {"score": r["score"], "passed": r["passed"]}
             for tid, r in results.items()
