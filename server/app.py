@@ -143,22 +143,90 @@ def _build_reward(reward_value: float, env: SelfHealEnv) -> SelfHealReward:
 
 @app.get("/health")
 def health():
-    """Liveness check — required by HF Spaces ping test."""
-    return {"status": "ok", "environment": "selfheal-rl", "version": "1.0.0"}
+    """Liveness check — OpenEnv spec requires status: 'healthy'."""
+    return {"status": "healthy", "environment": "selfheal-rl", "version": "1.0.0"}
 
 
 @app.get("/")
 def root():
-    """Root redirect to docs."""
     return {
         "name": "SelfHealRL",
         "description": "OpenEnv RL environment for autonomous microservice recovery",
         "docs": "/docs",
         "tasks": "/tasks",
-        "endpoints": {
-            "reset": "POST /reset",
-            "step": "POST /step",
-            "state": "GET /state",
+    }
+
+
+@app.get("/metadata")
+def metadata():
+    """OpenEnv spec: returns name and description."""
+    return {
+        "name": "SelfHealRL",
+        "description": (
+            "An RL environment where an agent must diagnose and fix cascading failures "
+            "in a 10-service microservice mesh."
+        ),
+        "version": "1.0.0",
+        "author": "revtiraman",
+        "tasks": list_tasks(),
+    }
+
+
+@app.get("/schema")
+def schema():
+    """OpenEnv spec: returns action, observation, and state schemas."""
+    return {
+        "action": {
+            "type": "object",
+            "description": "Action sent by the agent",
+            "properties": {
+                "action_int": {"type": "integer", "minimum": 0, "maximum": 59},
+                "action_type": {"type": "string", "enum": list(ACTION_TYPES)},
+                "target_service": {"type": "string", "enum": list(SERVICE_NAMES)},
+            },
+        },
+        "observation": {
+            "type": "object",
+            "description": "Observation returned by the environment",
+            "properties": {
+                "obs_vector": {"type": "array", "items": {"type": "number"}, "minItems": 104, "maxItems": 104},
+                "services": {"type": "array"},
+                "system_health": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "down_services": {"type": "array", "items": {"type": "string"}},
+                "step": {"type": "integer"},
+                "actions_remaining": {"type": "integer"},
+            },
+        },
+        "state": {
+            "type": "object",
+            "description": "Current episode state",
+            "properties": {
+                "episode_id": {"type": "string"},
+                "step": {"type": "integer"},
+                "done": {"type": "boolean"},
+                "system_health": {"type": "number"},
+                "total_reward": {"type": "number"},
+            },
+        },
+    }
+
+
+class MCPRequest(BaseModel):
+    jsonrpc: Optional[str] = "2.0"
+    id: Optional[Any] = None
+    method: Optional[str] = None
+    params: Optional[Any] = None
+
+@app.post("/mcp")
+def mcp(request: MCPRequest = None):
+    """OpenEnv spec: MCP JSON-RPC endpoint."""
+    req_id = request.id if request else None
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "result": {
+            "name": "SelfHealRL",
+            "description": "OpenEnv RL environment for autonomous microservice recovery",
         },
     }
 
