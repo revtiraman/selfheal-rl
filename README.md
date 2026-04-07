@@ -30,10 +30,10 @@ tags:
 
 | Task | Score | Threshold | Status |
 |:-----|:-----:|:---------:|:------:|
-| task_easy — Single Fault Recovery | **0.9000** | ≥ 0.70 | ✅ PASS |
-| task_medium — Cascade Recovery | **0.8100** | ≥ 0.60 | ✅ PASS |
-| task_hard — Multi-Fault Recovery | **0.7241** | ≥ 0.50 | ✅ PASS |
-| **Overall (LLM Baseline)** | **0.8114** | | ✅ ALL PASSED |
+| task_easy — Single Fault Recovery | **0.9917** | ≥ 0.70 | ✅ PASS |
+| task_medium — Cascade Recovery | **0.9667** | ≥ 0.60 | ✅ PASS |
+| task_hard — Multi-Fault Recovery | **0.8214** | ≥ 0.50 | ✅ PASS |
+| **Overall (Heuristic Baseline)** | **0.9266** | | ✅ ALL PASSED |
 
 **[🎮 Try the Live Demo](https://huggingface.co/spaces/revti126/selfheal-rl-demo)** · **[📖 API Docs](https://revti126-selfheal-rl.hf.space/docs)**
 
