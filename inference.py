@@ -1,20 +1,17 @@
 """SelfHealRL — Baseline inference script (OpenEnv Hackathon).
 
-Runs an LLM agent against all 3 tasks using the OpenAI API client.
-Reads credentials from environment variables:
-  API_BASE_URL  — LLM API endpoint (e.g. https://api.openai.com/v1)
-  MODEL_NAME    — Model identifier (e.g. gpt-4o-mini)
-  HF_TOKEN      — HuggingFace / API key
+Connects to the running SelfHealRL environment container via HTTP and runs
+an LLM agent against all 3 tasks.
+
+Environment variables:
+  API_BASE_URL   — LLM API endpoint  (default: https://router.huggingface.co/v1)
+  MODEL_NAME     — Model identifier   (default: gpt-4o-mini)
+  HF_TOKEN       — HuggingFace / API key (required, no default)
+  ENV_URL        — SelfHealRL env URL (default: http://localhost:8000)
 
 Usage:
-  export API_BASE_URL=https://api.openai.com/v1
-  export MODEL_NAME=gpt-4o-mini
-  export HF_TOKEN=sk-...
+  export HF_TOKEN=hf_...
   python inference.py
-
-Output:
-  Prints per-task scores and overall baseline score to stdout.
-  Runtime: < 20 minutes on 2 vCPU / 8 GB.
 """
 
 from __future__ import annotations
@@ -23,17 +20,9 @@ import json
 import os
 import sys
 import time
-import re
-from typing import Optional
 
-sys.path.insert(0, os.path.dirname(__file__))
-
+import requests
 from openai import OpenAI
-
-from config import ACTION_TYPES, MAX_STEPS_PER_EPISODE, SERVICE_NAMES
-from core.tasks import TASKS, TaskGrader
-from env.failure_engine import FailureEngine
-from env.selfheal_env import SelfHealEnv
 
 # ─────────────────────────────────────────────────────────────────
 # Config from env vars
@@ -42,12 +31,25 @@ from env.selfheal_env import SelfHealEnv
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 HF_TOKEN     = os.environ.get("HF_TOKEN")
+ENV_URL      = os.environ.get("ENV_URL", "http://localhost:8000").rstrip("/")
 
 if not HF_TOKEN:
-    print("ERROR: HF_TOKEN environment variable not set.")
+    print("ERROR: HF_TOKEN environment variable not set.", file=sys.stderr)
     sys.exit(1)
 
 client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
+
+# ─────────────────────────────────────────────────────────────────
+# Task definitions (mirrored from openenv.yaml)
+# ─────────────────────────────────────────────────────────────────
+
+TASKS = [
+    {"task_id": "task_easy",   "passing_score": 0.7},
+    {"task_id": "task_medium", "passing_score": 0.6},
+    {"task_id": "task_hard",   "passing_score": 0.5},
+]
+
+MAX_STEPS = 30
 
 # ─────────────────────────────────────────────────────────────────
 # System prompt
@@ -67,17 +69,16 @@ RULES:
 1. Fix upstream services (dependencies) BEFORE downstream services.
 2. OBSERVE a service before restarting/fixing it — you need to know the failure type.
 3. Choose the best action for the failure type:
-   - memory_leak     → scale_up (70%) or restart (60%)
-   - cpu_spike       → scale_up (85%) or restart (75%)
-   - bad_deployment  → rollback (95%)
-   - network_partition → reroute (80%)
-   - disk_full       → restart (20%) — low success, try reroute
-   - connection_timeout → reroute (70%) or restart (80%)
+   - memory_leak     → scale_up
+   - cpu_spike       → scale_up or restart
+   - bad_deployment  → rollback
+   - network_partition → reroute
+   - disk_full       → reroute or restart
+   - connection_timeout → reroute or restart
 4. Do NOT repeat the same action on the same healthy service.
 5. Do NOT do_nothing when services are down.
 
-AVAILABLE ACTIONS:
-  restart, scale_up, reroute, rollback, observe, do_nothing
+AVAILABLE ACTIONS: restart, scale_up, reroute, rollback, observe, do_nothing
 
 AVAILABLE SERVICES:
   api-gateway, auth-service, payment-service, order-service,
@@ -88,261 +89,239 @@ Respond with ONLY valid JSON:
 {"action_type": "<action>", "target_service": "<service>", "reasoning": "<1 sentence>"}
 """
 
+VALID_ACTIONS   = ["restart", "scale_up", "reroute", "rollback", "observe", "do_nothing"]
+VALID_SERVICES  = [
+    "api-gateway", "auth-service", "payment-service", "order-service",
+    "search-service", "notification-service", "user-db", "cache-layer",
+    "restaurant-db", "order-db",
+]
+
+# ─────────────────────────────────────────────────────────────────
+# HTTP helpers
+# ─────────────────────────────────────────────────────────────────
+
+def env_reset(task_id: str, seed: int = 42) -> dict:
+    r = requests.post(f"{ENV_URL}/reset/{task_id}", params={"seed": seed}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def env_step(action_type: str, target_service: str, session_id: str = "default") -> dict:
+    payload = {"action_type": action_type, "target_service": target_service}
+    r = requests.post(
+        f"{ENV_URL}/step",
+        json=payload,
+        params={"session_id": session_id},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def env_health() -> bool:
+    try:
+        r = requests.get(f"{ENV_URL}/health", timeout=10)
+        return r.status_code == 200
+    except Exception:
+        return False
 
 # ─────────────────────────────────────────────────────────────────
 # Observation formatter
 # ─────────────────────────────────────────────────────────────────
 
-def format_observation(env: SelfHealEnv, step: int) -> str:
-    """Format env state as a text prompt for the LLM."""
-    statuses = env.mesh.get_all_statuses()
-    alerts = env.obs_encoder.get_alerts(env.mesh)
-    observed = env.obs_encoder.observed_services
-
+def format_observation(obs: dict, step: int) -> str:
     lines = [
-        f"STEP {step}/{MAX_STEPS_PER_EPISODE} | "
-        f"Actions remaining: {env.actions_remaining} | "
-        f"System health: {env.mesh.system_health():.0%}",
+        f"STEP {step}/{MAX_STEPS} | "
+        f"Actions remaining: {obs.get('actions_remaining', '?')} | "
+        f"System health: {obs.get('system_health', 0):.0%}",
         "",
         "SERVICE STATUS:",
     ]
+    for svc in obs.get("services", []):
+        status_val = svc.get("status", -1)
+        if status_val >= 0.9:
+            status_str = "HEALTHY"
+        elif status_val >= 0.4:
+            status_str = "DEGRADED"
+        elif status_val >= 0.0:
+            status_str = "DOWN"
+        else:
+            status_str = "UNKNOWN"
 
-    for name in SERVICE_NAMES:
-        d = statuses[name]
-        status_str = {1.0: "HEALTHY", 0.5: "DEGRADED", 0.0: "DOWN"}.get(
-            round(d["status"], 1), f"status={d['status']:.2f}"
-        )
-        alert_str = " ⚠️ALERT" if name in alerts else ""
-        obs_str = ""
-        if name in observed or not env.partial_observability:
-            svc = env.mesh.services[name]
-            ft = f" failure_type={svc.failure_type}" if svc.failure_type else ""
-            obs_str = (
-                f" cpu={d.get('cpu', 0):.0%} mem={d.get('memory', 0):.0%}"
-                f" latency={d.get('latency', 0):.0f}ms err={d.get('error_rate', 0):.0%}"
-                f"{ft}"
+        alert_str = " ⚠️ALERT" if svc.get("alert") else ""
+        if svc.get("observed"):
+            ft = f" failure={svc['failure_type']}" if svc.get("failure_type") else ""
+            detail = (
+                f" cpu={svc.get('cpu', 0):.0%} mem={svc.get('memory', 0):.0%}"
+                f" err={svc.get('error_rate', 0):.0%}{ft}"
             )
         else:
-            obs_str = " [NOT OBSERVED — use observe action to see metrics]"
+            detail = " [NOT OBSERVED]"
+        lines.append(f"  {svc['name']:25s} {status_str:8s}{alert_str}{detail}")
 
-        lines.append(f"  {name:25s} {status_str:8s}{alert_str}{obs_str}")
-
-    down = env.mesh.get_down_services()
-    degraded = env.mesh.get_degraded_services()
+    down = obs.get("down_services", [])
+    degraded = obs.get("degraded_services", [])
     if down:
-        lines.append(f"\nDOWN SERVICES: {', '.join(down)}")
+        lines.append(f"\nDOWN: {', '.join(down)}")
     if degraded:
-        lines.append(f"DEGRADED SERVICES: {', '.join(degraded)}")
+        lines.append(f"DEGRADED: {', '.join(degraded)}")
     if not down and not degraded:
         lines.append("\n✅ All services healthy!")
-
     return "\n".join(lines)
-
 
 # ─────────────────────────────────────────────────────────────────
 # LLM agent
 # ─────────────────────────────────────────────────────────────────
 
-def llm_action(observation_text: str, history: list) -> tuple[str, str, str]:
-    """Call the LLM and return (action_type, target_service, reasoning)."""
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-    ]
-    # Include last 3 steps of history for context
+def llm_action(obs_text: str, history: list) -> tuple[str, str, str]:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for h in history[-3:]:
         messages.append({"role": "assistant", "content": json.dumps(h)})
+    messages.append({"role": "user", "content": obs_text})
 
-    messages.append({"role": "user", "content": observation_text})
-
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
-        temperature=0.0,
-        max_tokens=150,
-    )
-
-    raw = response.choices[0].message.content.strip()
-
-    # Parse JSON from response
     try:
-        # Extract JSON even if wrapped in markdown
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=150,
+        )
+        raw = response.choices[0].message.content.strip()
+        import re
         match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            parsed = json.loads(match.group())
-        else:
-            parsed = json.loads(raw)
-
-        action_type = parsed.get("action_type", "observe")
-        target_service = parsed.get("target_service", SERVICE_NAMES[0])
-        reasoning = parsed.get("reasoning", "")
-
-        # Validate
-        if action_type not in ACTION_TYPES:
+        parsed = json.loads(match.group() if match else raw)
+        action_type    = parsed.get("action_type", "observe")
+        target_service = parsed.get("target_service", VALID_SERVICES[0])
+        reasoning      = parsed.get("reasoning", "")
+        if action_type not in VALID_ACTIONS:
             action_type = "observe"
-        if target_service not in SERVICE_NAMES:
-            target_service = SERVICE_NAMES[0]
-
+        if target_service not in VALID_SERVICES:
+            target_service = VALID_SERVICES[0]
         return action_type, target_service, reasoning
-
-    except (json.JSONDecodeError, KeyError):
-        # Fallback: parse with regex
-        at_match = re.search(r'"action_type"\s*:\s*"(\w+)"', raw)
-        ts_match = re.search(r'"target_service"\s*:\s*"([\w-]+)"', raw)
-        action_type = at_match.group(1) if at_match else "observe"
-        target_service = ts_match.group(1) if ts_match else SERVICE_NAMES[0]
-        if action_type not in ACTION_TYPES:
-            action_type = "observe"
-        if target_service not in SERVICE_NAMES:
-            target_service = SERVICE_NAMES[0]
-        return action_type, target_service, raw[:80]
-
+    except Exception as e:
+        return "observe", VALID_SERVICES[0], f"fallback:{e}"
 
 # ─────────────────────────────────────────────────────────────────
 # Run one task
 # ─────────────────────────────────────────────────────────────────
 
-def run_task(task_id: str, seed: int = 42) -> dict:
-    """Run a single task with the LLM agent. Emits [START]/[STEP]/[END] logs."""
-    task = TASKS[task_id]
-    engine = FailureEngine()
+def run_task(task_id: str, passing_score: float, seed: int = 42) -> dict:
+    reset_resp = env_reset(task_id, seed=seed)
+    obs        = reset_resp["observation"]
+    info       = reset_resp.get("info", {})
 
-    env = SelfHealEnv(
-        difficulty=task.difficulty,
-        partial_observability=task.partial_observability,
-    )
-    env.reset(seed=seed)
-
-    # Apply fixed scenario
-    scenario = engine.generate_from_template(task.scenario_template)
-    env.mesh.reset()
-    engine.apply_scenario(env.mesh, scenario)
-    env.cascade_sim.reset()
-    for svc, _ in scenario.root_failures:
-        env.cascade_sim.record_root_cause(svc)
-    env.scenario = scenario
-    env._prev_down = set(env.mesh.get_down_services())
-    env._prev_degraded = set(env.mesh.get_degraded_services())
-
-    # [START] log
     print(json.dumps({
-        "type": "START",
-        "task_id": task_id,
-        "task_name": task.name,
-        "difficulty": task.difficulty,
-        "scenario": scenario.description,
-        "model": MODEL_NAME,
-        "seed": seed,
+        "type":         "START",
+        "task_id":      task_id,
+        "scenario":     info.get("scenario", ""),
+        "difficulty":   info.get("difficulty", ""),
+        "model":        MODEL_NAME,
+        "seed":         seed,
     }))
     sys.stdout.flush()
 
     action_history = []
-    done = False
-    step = 0
+    step           = 0
+    done           = False
+    score          = 0.0
 
-    while not done and step < task.max_steps:
-        obs_text = format_observation(env, step)
+    while not done and step < MAX_STEPS:
+        obs_text = format_observation(obs, step)
+        action_type, target_service, reasoning = llm_action(obs_text, action_history)
 
-        try:
-            action_type, target_service, reasoning = llm_action(obs_text, action_history)
-        except Exception as e:
-            action_type, target_service, reasoning = "observe", SERVICE_NAMES[0], f"fallback:{e}"
-
-        action_int = (
-            ACTION_TYPES.index(action_type) * len(SERVICE_NAMES)
-            + SERVICE_NAMES.index(target_service)
-        )
-
-        _, reward, terminated, truncated, _ = env.step(action_int)
-        done = terminated or truncated
-        step += 1
+        step_resp = env_step(action_type, target_service)
+        obs       = step_resp["observation"]
+        reward    = step_resp["reward"]["total"]
+        done      = step_resp["done"]
+        step_info = step_resp.get("info", {})
+        step     += 1
 
         action_history.append({
-            "action_type": action_type,
-            "target_service": target_service,
-            "reasoning": reasoning,
-            "reward": reward,
+            "action_type": action_type, "target_service": target_service,
+            "reasoning": reasoning, "reward": reward,
         })
 
-        # [STEP] log
         print(json.dumps({
-            "type": "STEP",
-            "task_id": task_id,
-            "step": step,
-            "action": f"{action_type}({target_service})",
-            "action_type": action_type,
+            "type":           "STEP",
+            "task_id":        task_id,
+            "step":           step,
+            "action":         f"{action_type}({target_service})",
+            "action_type":    action_type,
             "target_service": target_service,
-            "reward": round(reward, 4),
-            "system_health": round(env.mesh.system_health(), 4),
-            "down_services": env.mesh.get_down_services(),
-            "done": done,
-            "reasoning": reasoning,
+            "reward":         round(reward, 4),
+            "system_health":  round(obs.get("system_health", 0), 4),
+            "down_services":  obs.get("down_services", []),
+            "done":           done,
+            "reasoning":      reasoning,
         }))
         sys.stdout.flush()
 
-    summary = env.get_episode_summary()
-    grade = TaskGrader.grade(task_id, summary)
+        if done:
+            score = step_info.get("overall_score", 0.0)
+            task_grade = step_info.get("task_grade", {})
+            if task_grade:
+                score = task_grade.get("score", score)
 
-    # [END] log
     print(json.dumps({
-        "type": "END",
-        "task_id": task_id,
-        "task_name": task.name,
-        "score": grade["score"],
-        "passed": grade["passed"],
-        "passing_score": grade["passing_score"],
-        "fully_recovered": summary.get("fully_recovered", False),
-        "final_health": round(summary.get("final_health", 0.0), 4),
-        "steps_taken": step,
-        "total_reward": round(summary.get("total_reward", 0.0), 4),
-        "breakdown": grade["breakdown"],
+        "type":             "END",
+        "task_id":          task_id,
+        "score":            round(score, 4),
+        "passed":           score >= passing_score,
+        "passing_score":    passing_score,
+        "fully_recovered":  obs.get("system_health", 0) >= 1.0,
+        "final_health":     round(obs.get("system_health", 0), 4),
+        "steps_taken":      step,
     }))
     sys.stdout.flush()
 
-    return grade
-
+    return {"task_id": task_id, "score": score, "passed": score >= passing_score,
+            "passing_score": passing_score}
 
 # ─────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────
 
 def main():
-    results = {}
+    # Wait for env to be ready
+    for attempt in range(12):
+        if env_health():
+            break
+        time.sleep(5)
+    else:
+        print("ERROR: Environment not reachable at", ENV_URL, file=sys.stderr)
+        sys.exit(1)
+
+    results     = {}
     total_start = time.time()
 
-    for task_id in ["task_easy", "task_medium", "task_hard"]:
-        task = TASKS[task_id]
-        start = time.time()
+    for task in TASKS:
+        task_id      = task["task_id"]
+        passing_score = task["passing_score"]
         try:
-            grade = run_task(task_id, seed=42)
+            grade = run_task(task_id, passing_score, seed=42)
             results[task_id] = grade
         except Exception as e:
-            elapsed = time.time() - start
             print(json.dumps({
-                "type": "END",
-                "task_id": task_id,
-                "score": 0.0,
-                "passed": False,
-                "passing_score": task.passing_score,
-                "error": str(e),
+                "type": "END", "task_id": task_id,
+                "score": 0.0, "passed": False,
+                "passing_score": passing_score, "error": str(e),
             }))
             sys.stdout.flush()
             results[task_id] = {
                 "task_id": task_id, "score": 0.0, "passed": False,
-                "passing_score": task.passing_score,
-                "breakdown": {}, "details": {"error": str(e)},
+                "passing_score": passing_score,
             }
 
     total_elapsed = time.time() - total_start
-    overall = sum(r["score"] for r in results.values()) / len(results)
-    all_passed = all(r["passed"] for r in results.values())
+    overall       = sum(r["score"] for r in results.values()) / len(results)
+    all_passed    = all(r["passed"] for r in results.values())
 
-    # Final summary
     print(json.dumps({
-        "type": "SUMMARY",
-        "model": MODEL_NAME,
-        "overall_score": round(overall, 4),
-        "all_passed": all_passed,
-        "total_time_seconds": round(total_elapsed, 1),
+        "type":                "SUMMARY",
+        "model":               MODEL_NAME,
+        "overall_score":       round(overall, 4),
+        "all_passed":          all_passed,
+        "total_time_seconds":  round(total_elapsed, 1),
         "tasks": {
             tid: {"score": r["score"], "passed": r["passed"]}
             for tid, r in results.items()
