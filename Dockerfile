@@ -5,7 +5,7 @@
 # Run:    docker run -p 8000:8000 selfheal-rl
 # Test:   curl http://localhost:8000/health
 
-FROM python:3.10-slim
+FROM python:3.10.14-slim-bullseye
 
 # ── System deps ───────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
